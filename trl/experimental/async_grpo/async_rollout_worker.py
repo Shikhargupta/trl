@@ -108,6 +108,8 @@ class AsyncRolloutWorker:
         weight_names: list[str] | None = None,
         weight_dtype_names: list[str] | None = None,
         weight_shapes: list[list[int]] | None = None,
+        dynamic_sampling: bool = False,
+        scale_rewards: str = "group",
     ):
         if not is_vllm_available(min_version="0.17.1"):
             raise ImportError(
@@ -166,6 +168,16 @@ class AsyncRolloutWorker:
         self.chat_template_kwargs = chat_template_kwargs or {}
         self.log_completions = log_completions
         self.num_completions_to_print = num_completions_to_print
+        self.dynamic_sampling = dynamic_sampling
+        self._total_groups_dropped = 0
+        if scale_rewards not in {"group", "batch", "none"}:
+            raise ValueError(
+                f"Unknown scale_rewards: {scale_rewards}. Supported values are 'group', 'batch', and 'none'."
+            )
+        # 'group' is fully handled here. 'none' is the Dr. GRPO setting (centered reward, no std divide).
+        # 'batch' is also computed as centered reward here; the trainer's compute_loss does the cross-rank std
+        # divide because it requires reductions across groups that this worker doesn't see.
+        self.scale_rewards = scale_rewards
         self.tokenizer = processing_class
         self.tokenizer = add_response_schema(self.tokenizer)
         # In multi-turn training, the chat template *must* be prefix-preserving. If the tokenizer's original template
@@ -673,10 +685,25 @@ class AsyncRolloutWorker:
         # and use nansum so that a None from one function doesn't affect the others, matching TRL.
         all_rewards = [[r if r is not None else float("nan") for r in row] for row in all_rewards]
         rewards = np.nansum(np.array(all_rewards, dtype=float), axis=0)
-        advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
         reward_mean = float(rewards.mean())
         reward_std = float(rewards.std())
+        if self.scale_rewards == "group":
+            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        else:
+            # 'none' and 'batch' both send centered rewards. For 'batch' the trainer divides by the cross-rank std.
+            advantages = rewards - rewards.mean()
         logger.info(f"Rollout metrics: reward_mean={reward_mean:.4f}, reward_std={reward_std:.4f}")
+
+        # DAPO-style dynamic sampling: drop groups with zero reward std (all completions got the same reward),
+        # since their advantages are all zero and contribute nothing to the gradient. The generation loop keeps
+        # producing groups, so the trainer eventually sees enough non-degenerate batches.
+        if self.dynamic_sampling and reward_std == 0.0:
+            self._total_groups_dropped += 1
+            logger.info(
+                f"[dynamic_sampling] dropping zero-std group (reward={reward_mean:.4f}); "
+                f"total_dropped={self._total_groups_dropped}"
+            )
+            return []
 
         # tools/call_frequency: mean calls per completion (matches TRL's total_calls / num_completions)
         # tools/failure_frequency: per-completion failure rate; averaged across samples in compute_loss

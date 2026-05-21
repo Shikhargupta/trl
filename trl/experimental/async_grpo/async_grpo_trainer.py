@@ -382,6 +382,8 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     max_tool_calling_iterations=self.args.max_tool_calling_iterations,
                     log_completions=self.args.log_completions,
                     num_completions_to_print=self.args.num_completions_to_print,
+                    dynamic_sampling=self.args.dynamic_sampling,
+                    scale_rewards=self.args.scale_rewards,
                     weight_names=weight_names,
                     weight_dtype_names=weight_dtype_names,
                     weight_shapes=weight_shapes,
@@ -462,6 +464,14 @@ class AsyncGRPOTrainer(_BaseTrainer):
 
         completion_mask = completion_mask[:, 1:]
         old_log_probs = old_log_probs[:, 1:]
+
+        if self.args.scale_rewards == "batch":
+            # Worker pre-centered the rewards but didn't divide by std (it only saw one group). Gather across
+            # ranks and divide by the global microbatch std so every sample gets the same scale.
+            gathered = self.accelerator.gather(advantages)
+            batch_std = gathered.std()
+            advantages = advantages / (batch_std + 1e-8)
+
         advantages = advantages.unsqueeze(1)
         log_ratio = log_probs - old_log_probs
         ratio = torch.exp(log_ratio)
@@ -469,15 +479,22 @@ class AsyncGRPOTrainer(_BaseTrainer):
         per_token_loss = -torch.min(ratio * advantages, clipped * advantages)
 
         # DDP/FSDP averages gradients across ranks (world_size).
-        # To get correct per-token normalization we scale by 1/tokens_per_rank
-        # = world_size / global_n_tokens, so after DDP averaging the effective
+        # - "grpo": divide by tokens_per_rank = global_n_tokens / world_size so that after DDP averaging each token
+        #   in the microbatch contributes 1/global_n_tokens. With gradient accumulation, tokens in long-sequence
+        #   microbatches get less weight than tokens in short-sequence microbatches.
+        # - "dapo": divide by the local sequence count so that after DDP averaging each token contributes
+        #   1/global_batch_size, giving every token equal weight across the full accumulated batch
+        #   (https://huggingface.co/papers/2503.14476).
         loss = (per_token_loss * completion_mask).sum()
         global_n_tokens = inputs["global_n_tokens"][0]
         world_size = self.accelerator.num_processes
-        tokens_per_rank = (global_n_tokens / world_size).clamp(min=1.0)
-        loss = loss / tokens_per_rank.to(torch.float32)
-        # For DAPO, we would scale like this instead:
-        # loss = loss / max(per_token_loss.size(0), 1)
+        if self.args.loss_type == "grpo":
+            tokens_per_rank = (global_n_tokens / world_size).clamp(min=1.0)
+            loss = loss / tokens_per_rank.to(torch.float32)
+        elif self.args.loss_type == "dapo":
+            loss = loss / max(per_token_loss.size(0), 1)
+        else:
+            raise ValueError(f"Unknown loss type: {self.args.loss_type}. Supported values are 'grpo' and 'dapo'.")
         loss = loss / self.current_gradient_accumulation_steps
 
         with torch.no_grad():

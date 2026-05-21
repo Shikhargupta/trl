@@ -58,6 +58,32 @@ class AsyncGRPOConfig(_BaseConfig):
             Lower-bound epsilon value for clipping.
         epsilon_high (`float`, *optional*, defaults to `0.2`):
             Upper-bound epsilon value for clipping.
+        loss_type (`str`, *optional*, defaults to `"grpo"`):
+            Loss formulation. Supported values are:
+
+            - `"grpo"` (default): Normalizes the summed per-token loss by the number of completion tokens in the
+              microbatch. Tokens in long-sequence microbatches are down-weighted relative to tokens in short-sequence
+              microbatches.
+            - `"dapo"`: Normalizes the summed per-token loss by the per-microbatch sequence count, so that every token
+              contributes equally across the full accumulated batch. This is the formulation from the
+              [DAPO](https://huggingface.co/papers/2503.14476) paper.
+        scale_rewards (`str`, *optional*, defaults to `"group"`):
+            Reward scaling strategy used when computing advantages:
+
+            - `"group"` (default): Scale each reward by the standard deviation within its group (the rollouts for
+              one prompt), ensuring unit variance per group. This is the standard GRPO formulation.
+            - `"batch"`: Center each reward by its group mean, then divide by the standard deviation across all
+              rollouts in the trainer microbatch (gathered across DDP ranks).
+            - `"none"`: Center each reward by its group mean with no std scaling. Recommended by the
+              [Dr. GRPO](https://huggingface.co/papers/2503.20783) paper, which shows that std-based scaling
+              introduces a question-level difficulty bias. Note that turning off std-based scaling also removes
+              variance normalization, so update magnitudes depend directly on the raw reward scale and batch
+              composition.
+        dynamic_sampling (`bool`, *optional*, defaults to `False`):
+            Whether to enable dynamic sampling, as proposed in the [DAPO](https://huggingface.co/papers/2503.14476)
+            paper. When enabled, groups whose completions all receive the same reward (i.e. zero-std groups, which
+            would produce zero advantages) are discarded by the rollout worker instead of being pushed to the trainer.
+            The worker keeps generating until non-degenerate groups are produced.
 
         > Parameters that control the async rollout pipeline
 
@@ -156,6 +182,39 @@ class AsyncGRPOConfig(_BaseConfig):
     epsilon_high: float = field(
         default=0.2,
         metadata={"help": "Upper-bound epsilon value for clipping."},
+    )
+    loss_type: str = field(
+        default="grpo",
+        metadata={
+            "help": "Loss formulation. Supported values are 'grpo' and 'dapo'. 'grpo' (default) normalizes the "
+            "summed per-token loss by the number of completion tokens in the microbatch — long-sequence microbatches "
+            "down-weight their own tokens. 'dapo' normalizes by the per-microbatch sequence count instead, so that "
+            "every token contributes equally across the full accumulated batch (the formulation from "
+            "https://huggingface.co/papers/2503.14476).",
+            "choices": ["grpo", "dapo"],
+        },
+    )
+    scale_rewards: str = field(
+        default="group",
+        metadata={
+            "help": "Reward scaling strategy used when computing advantages. Supported values: "
+            "'group' (default): scale each reward by the standard deviation within its group (the rollouts for one "
+            "prompt), ensuring unit variance per group. 'batch': center per-group, then divide by the standard "
+            "deviation across all rollouts in the trainer microbatch (gathered across DDP ranks). 'none': center "
+            "per-group with no std scaling, as recommended in the Dr. GRPO paper "
+            "(https://huggingface.co/papers/2503.20783), which shows that std-based scaling introduces a "
+            "question-level difficulty bias.",
+            "choices": ["group", "batch", "none"],
+        },
+    )
+    dynamic_sampling: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to enable dynamic sampling, as proposed in the DAPO paper "
+            "(https://huggingface.co/papers/2503.14476). When enabled, groups whose completions all receive the same "
+            "reward (i.e. zero-std groups, which produce zero advantages) are discarded by the rollout worker instead "
+            "of being pushed to the trainer. The worker keeps generating until non-degenerate groups are produced."
+        },
     )
 
     # Parameters that control the async rollout pipeline
