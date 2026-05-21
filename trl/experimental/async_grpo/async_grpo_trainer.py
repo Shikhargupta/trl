@@ -78,39 +78,65 @@ class StepIntervalCallback(TrainerCallback):
 
 
 class RolloutQueueDataset(torch.utils.data.IterableDataset):
-    def __init__(self, rollout_queue, model_version_fn, max_staleness=3, timeout=120.0):
+    def __init__(
+        self,
+        rollout_queue,
+        model_version_fn,
+        max_staleness=3,
+        timeout=120.0,
+        samples_per_accum_batch=None,
+    ):
         self.queue = rollout_queue
         self.model_version_fn = model_version_fn
         self.max_staleness = max_staleness
         self.timeout = timeout
+        # Number of (non-stale) samples that make up one full accumulated batch
+        # (= grad_accum × per_device_train_batch_size × num_processes). Buffering this many up front lets us
+        # compute `num_items_in_batch` (the DAPO normalizer that requires knowing total completion tokens across
+        # the whole accumulated batch) before any microbatch is dispatched.
+        self.samples_per_accum_batch = samples_per_accum_batch
 
-    def __iter__(self):
+    def _pull_one(self):
+        """Pull one non-stale sample from the queue. Returns (sample, wait_seconds) or None on timeout."""
         while True:
             t0 = time.time()
-            qsize = self.queue.qsize()
-            if qsize == 0:
+            if self.queue.qsize() == 0:
                 logger.info("queue empty, waiting for rollout samples...")
             try:
                 sample = self.queue.get(timeout=self.timeout)
             except queue.Empty:
                 logger.warning(f"Rollout queue empty for {self.timeout}s, stopping epoch")
-                return  # StopIteration ends epoch
-            queue_wait_time_s = time.time() - t0
-            if queue_wait_time_s > 1.0:
-                logger.info(f"waited {queue_wait_time_s:.1f}s for sample (qsize={self.queue.qsize()})")
-
+                return None
+            wait_s = time.time() - t0
+            if wait_s > 1.0:
+                logger.info(f"waited {wait_s:.1f}s for sample (qsize={self.queue.qsize()})")
             staleness = self.model_version_fn() - sample.model_version
             if staleness > self.max_staleness:
                 logger.info(f"dropping stale sample (staleness={staleness}, max={self.max_staleness})")
-                continue  # drop stale, pull next
+                continue
+            return sample, wait_s
 
-            yield {
-                "input_ids": sample.input_ids,
-                "completion_mask": sample.completion_mask,
-                "old_log_probs": sample.old_log_probs,
-                "advantage": sample.advantage,
-                "metrics": {**sample.metrics, "queue_wait_time_s": queue_wait_time_s},
-            }
+    def __iter__(self):
+        while True:
+            # Pre-buffer one accumulated batch so we know its total completion-token count up front.
+            buffer = []
+            for _ in range(self.samples_per_accum_batch):
+                pulled = self._pull_one()
+                if pulled is None:
+                    return  # StopIteration ends epoch
+                buffer.append(pulled)
+
+            accum_total_tokens = sum(int(sum(s.completion_mask)) for s, _ in buffer)
+
+            for sample, wait_s in buffer:
+                yield {
+                    "input_ids": sample.input_ids,
+                    "completion_mask": sample.completion_mask,
+                    "old_log_probs": sample.old_log_probs,
+                    "advantage": sample.advantage,
+                    "accum_total_tokens": accum_total_tokens,
+                    "metrics": {**sample.metrics, "queue_wait_time_s": wait_s},
+                }
 
 
 class _EmptyIterableDataset(torch.utils.data.IterableDataset):
@@ -142,6 +168,11 @@ class DataCollatorForRollout(DataCollatorMixin):
         global_n_tokens = completion_mask.sum()
         global_n_tokens_repeated = torch.full((len(examples),), global_n_tokens.item(), dtype=torch.float32)
 
+        # Total completion tokens across the *entire accumulated batch* (set by RolloutQueueDataset before
+        # any microbatch is dispatched). Same value on every sample so the per-rank slice carries it through.
+        accum_total_tokens = float(examples[0].get("accum_total_tokens", 0))
+        accum_total_tokens_repeated = torch.full((len(examples),), accum_total_tokens, dtype=torch.float32)
+
         # Convert per-sample metrics dicts to a dict of 1D tensors so that Accelerate's
         # recursive broadcast (dispatch_batches=True) can handle them — it traverses nested
         # dicts of tensors but chokes on plain Python floats.
@@ -162,6 +193,7 @@ class DataCollatorForRollout(DataCollatorMixin):
             "old_log_probs": old_log_probs,
             "advantages": advantages,
             "global_n_tokens": global_n_tokens_repeated,
+            "accum_total_tokens": accum_total_tokens_repeated,
             "metrics": metrics,
         }
 
@@ -398,11 +430,17 @@ class AsyncGRPOTrainer(_BaseTrainer):
 
     def get_train_dataloader(self) -> DataLoader:
         if self.accelerator.is_main_process:
+            samples_per_accum_batch = (
+                self.args.gradient_accumulation_steps
+                * self.args.per_device_train_batch_size
+                * self.accelerator.num_processes
+            )
             dataset = RolloutQueueDataset(
                 rollout_queue=self.rollout_queue,
                 model_version_fn=lambda: self.model_version,
                 max_staleness=self.args.max_staleness,
                 timeout=self.args.vllm_server_timeout,
+                samples_per_accum_batch=samples_per_accum_batch,
             )
         else:
             dataset = _EmptyIterableDataset()
@@ -432,6 +470,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 "old_log_probs",
                 "advantages",
                 "global_n_tokens",
+                "accum_total_tokens",
                 "metrics",
             ]
 
@@ -482,20 +521,22 @@ class AsyncGRPOTrainer(_BaseTrainer):
         # - "grpo": divide by tokens_per_rank = global_n_tokens / world_size so that after DDP averaging each token
         #   in the microbatch contributes 1/global_n_tokens. With gradient accumulation, tokens in long-sequence
         #   microbatches get less weight than tokens in short-sequence microbatches.
-        # - "dapo": divide by the local sequence count so that after DDP averaging each token contributes
-        #   1/global_batch_size, giving every token equal weight across the full accumulated batch
-        #   (https://huggingface.co/papers/2503.14476).
+        # - "dapo": divide by accum_total_tokens / world_size (total completion tokens across the full accumulated
+        #   batch, pre-buffered by RolloutQueueDataset). Skips the trailing /grad_accum because the normalizer
+        #   already counts tokens across all accumulation steps — matches GRPOTrainer's "dapo" exactly.
         loss = (per_token_loss * completion_mask).sum()
         global_n_tokens = inputs["global_n_tokens"][0]
         world_size = self.accelerator.num_processes
         if self.args.loss_type == "grpo":
             tokens_per_rank = (global_n_tokens / world_size).clamp(min=1.0)
             loss = loss / tokens_per_rank.to(torch.float32)
+            loss = loss / self.current_gradient_accumulation_steps
         elif self.args.loss_type == "dapo":
-            loss = loss / max(per_token_loss.size(0), 1)
+            accum_total_tokens = inputs["accum_total_tokens"][0]
+            normalizer = (accum_total_tokens / world_size).clamp(min=1.0)
+            loss = loss / normalizer.to(torch.float32)
         else:
             raise ValueError(f"Unknown loss type: {self.args.loss_type}. Supported values are 'grpo' and 'dapo'.")
-        loss = loss / self.current_gradient_accumulation_steps
 
         with torch.no_grad():
             valid_mask = completion_mask > 0
