@@ -591,6 +591,24 @@ class AsyncGRPOTrainer(_BaseTrainer):
             length_stats = self.accelerator.reduce(length_stats, reduction="sum")
             self._metrics["train"]["completions/mean_length"].append((length_stats[0] / length_stats[1]).item())
 
+            # Advantage stats for this microbatch's completions, reduced across
+            # ranks so the dashboard can plot the per-step advantage signal.
+            # `advantages` is [B_local, 1] here (unsqueezed above); flatten it.
+            # advantage_mean is ~0 by construction (group-centered); the spread
+            # (std / abs-mean) is the informative learning signal per step.
+            adv_flat = advantages.reshape(-1).float()
+            adv_stats = torch.stack(
+                [adv_flat.sum(), (adv_flat**2).sum(), adv_flat.abs().sum(), n_samples]
+            )
+            adv_stats = self.accelerator.reduce(adv_stats, reduction="sum")
+            adv_sum, adv_sqsum, adv_abssum, adv_n = adv_stats.unbind(0)
+            adv_mean = adv_sum / adv_n
+            self._metrics["train"]["advantage_mean"].append(adv_mean.item())
+            self._metrics["train"]["advantage_std"].append(
+                (adv_sqsum / adv_n - adv_mean**2).clamp(min=0).sqrt().item()
+            )
+            self._metrics["train"]["advantage_abs_mean"].append((adv_abssum / adv_n).item())
+
             # Training throughput: completion tokens consumed by this training step per second.
             now = time.time()
             if self._train_tokens_start_time is not None:

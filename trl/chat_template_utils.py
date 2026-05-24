@@ -389,6 +389,12 @@ def add_response_schema(processing_class: ProcessingClassT) -> ProcessingClassT:
         tokenizer = processing_class.tokenizer
     else:
         tokenizer = processing_class
+    # Respect a schema the caller already set explicitly. Lets callers that
+    # wrap/modify a known chat template (e.g. appending a reasoning primer,
+    # which defeats the exact-string match below) declare the right schema
+    # up front instead of hitting the unrecognized-template ValueError.
+    if getattr(tokenizer, "response_schema", None) is not None:
+        return processing_class
     if chat_template == glm4moe_chat_template:
         tokenizer.response_schema = glm4moe_schema
     elif chat_template == gptoss_chat_template:
